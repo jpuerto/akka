@@ -21,17 +21,12 @@ object ScalaDSL {
      * only a subtype of the widened set of messages.
      */
     def widen[U >: T](matcher: PartialFunction[U, T]): Behavior[U] = Widened(behavior, matcher)
-    /**
-     * Combine the two behaviors such that incoming messages are distributed
-     * to both of them, each one evolving its state independently.
-     */
-    def &&(other: Behavior[T]): Behavior[T] = And(behavior, other)
-    /**
-     * Combine the two behaviors such that incoming messages are given first to
-     * the left behavior and are then only passed on to the right behavior if
-     * the left one returned Unhandled.
-     */
-    def ||(other: Behavior[T]): Behavior[T] = Or(behavior, other)
+  }
+
+  private val _nullFun = (_: Any) => null
+  private def nullFun[T] = _nullFun.asInstanceOf[Any => T]
+  private implicit class ContextAs[T](val ctx: ActorContext[T]) extends AnyVal {
+    def as[U] = ctx.asInstanceOf[ActorContext[U]]
   }
 
   /**
@@ -40,7 +35,7 @@ object ScalaDSL {
    * at) and may transform the incoming message to place them into the wrapped
    * Behavior’s type hierarchy. Signals are not transformed.
    */
-  final case class Widened[T, U >: T](behavior: Behavior[T], matcher: PartialFunction[U, T]) extends Behavior[U] {
+  final case class Widened[T, U](behavior: Behavior[T], matcher: PartialFunction[U, T]) extends Behavior[U] {
     private def postProcess(ctx: ActorContext[U], behv: Behavior[T]): Behavior[U] =
       if (isUnhandled(behv)) Unhandled
       else if (isAlive(behv)) {
@@ -52,9 +47,10 @@ object ScalaDSL {
       postProcess(ctx, behavior.management(ctx.asInstanceOf[ActorContext[T]], msg))
 
     override def message(ctx: ActorContext[U], msg: U): Behavior[U] =
-      if (matcher.isDefinedAt(msg))
-        postProcess(ctx, behavior.message(ctx.asInstanceOf[ActorContext[T]], matcher(msg)))
-      else Unhandled
+      matcher.applyOrElse(msg, nullFun) match {
+        case null        => Unhandled
+        case transformed => postProcess(ctx, behavior.message(ctx.as[T], transformed))
+      }
 
     override def toString: String = s"${behavior.toString}.widen(${LineNumbers(matcher)})"
   }
@@ -256,136 +252,6 @@ object ScalaDSL {
       this
     }
     override def toString = s"Static(${LineNumbers(behavior)})"
-  }
-
-  /**
-   * This behavior allows sending messages to itself without going through the
-   * Actor’s mailbox. A message sent like this will be processed before the next
-   * message is taken out of the mailbox. In case of Actor failures outstanding
-   * messages that were sent to the synchronous self reference will be lost.
-   *
-   * This decorator is useful for passing messages between the left and right
-   * sides of [[And]] and [[Or]] combinators.
-   */
-  final case class SynchronousSelf[T](f: ActorRef[T] ⇒ Behavior[T]) extends Behavior[T] {
-
-    private class B extends Behavior[T] {
-      private val inbox = Inbox[T]("synchronousSelf")
-      private var _behavior = Behavior.validateAsInitial(f(inbox.ref))
-      private def behavior = _behavior
-      private def setBehavior(ctx: ActorContext[T], b: Behavior[T]): Unit =
-        _behavior = canonicalize(b, _behavior)
-
-      // FIXME should we protect against infinite loops?
-      @tailrec private def run(ctx: ActorContext[T], next: Behavior[T]): Behavior[T] = {
-        setBehavior(ctx, next)
-        if (inbox.hasMessages) run(ctx, behavior.message(ctx, inbox.receiveMsg()))
-        else if (isUnhandled(next)) Unhandled
-        else if (isAlive(next)) this
-        else Stopped
-      }
-
-      override def management(ctx: ActorContext[T], msg: Signal): Behavior[T] =
-        run(ctx, behavior.management(ctx, msg))
-      override def message(ctx: ActorContext[T], msg: T): Behavior[T] =
-        run(ctx, behavior.message(ctx, msg))
-
-      override def toString: String = s"SynchronousSelf($behavior)"
-    }
-
-    override def management(ctx: ActorContext[T], msg: Signal): Behavior[T] = {
-      if (msg != PreStart) throw new IllegalStateException(s"SynchronousSelf must receive PreStart as first message (got $msg)")
-      Behavior.preStart(new B(), ctx)
-    }
-
-    override def message(ctx: ActorContext[T], msg: T): Behavior[T] =
-      throw new IllegalStateException(s"SynchronousSelf must receive PreStart as first message (got $msg)")
-
-    override def toString: String = s"SynchronousSelf(${LineNumbers(f)})"
-  }
-
-  /**
-   * A behavior combinator that feeds incoming messages and signals both into
-   * the left and right sub-behavior and allows them to evolve independently of
-   * each other. When one of the sub-behaviors terminates the other takes over
-   * exclusively. When both sub-behaviors respond to a [[Failed]] signal, the
-   * response with the higher precedence is chosen (see [[Failed$]]).
-   */
-  final case class And[T](left: Behavior[T], right: Behavior[T]) extends Behavior[T] {
-
-    override def management(ctx: ActorContext[T], msg: Signal): Behavior[T] = {
-      val l = left.management(ctx, msg)
-      val r = right.management(ctx, msg)
-      if (isUnhandled(l) && isUnhandled(r)) Unhandled
-      else {
-        val nextLeft = canonicalize(l, left)
-        val nextRight = canonicalize(r, right)
-        val leftAlive = isAlive(nextLeft)
-        val rightAlive = isAlive(nextRight)
-
-        if (leftAlive && rightAlive) And(nextLeft, nextRight)
-        else if (leftAlive) nextLeft
-        else if (rightAlive) nextRight
-        else Stopped
-      }
-    }
-
-    override def message(ctx: ActorContext[T], msg: T): Behavior[T] = {
-      val l = left.message(ctx, msg)
-      val r = right.message(ctx, msg)
-      if (isUnhandled(l) && isUnhandled(r)) Unhandled
-      else {
-        val nextLeft = canonicalize(l, left)
-        val nextRight = canonicalize(r, right)
-        val leftAlive = isAlive(nextLeft)
-        val rightAlive = isAlive(nextRight)
-
-        if (leftAlive && rightAlive) And(nextLeft, nextRight)
-        else if (leftAlive) nextLeft
-        else if (rightAlive) nextRight
-        else Stopped
-      }
-    }
-  }
-
-  /**
-   * A behavior combinator that feeds incoming messages and signals either into
-   * the left or right sub-behavior and allows them to evolve independently of
-   * each other. The message or signal is passed first into the left sub-behavior
-   * and only if that results in [[#Unhandled]] is it passed to the right
-   * sub-behavior. When one of the sub-behaviors terminates the other takes over
-   * exclusively. When both sub-behaviors respond to a [[Failed]] signal, the
-   * response with the higher precedence is chosen (see [[Failed$]]).
-   */
-  final case class Or[T](left: Behavior[T], right: Behavior[T]) extends Behavior[T] {
-
-    override def management(ctx: ActorContext[T], msg: Signal): Behavior[T] =
-      left.management(ctx, msg) match {
-        case b if isUnhandled(b) ⇒
-          val r = right.management(ctx, msg)
-          if (isUnhandled(r)) Unhandled
-          else {
-            val nr = canonicalize(r, right)
-            if (isAlive(nr)) Or(left, nr) else left
-          }
-        case nl ⇒
-          val next = canonicalize(nl, left)
-          if (isAlive(next)) Or(next, right) else right
-      }
-
-    override def message(ctx: ActorContext[T], msg: T): Behavior[T] =
-      left.message(ctx, msg) match {
-        case b if isUnhandled(b) ⇒
-          val r = right.message(ctx, msg)
-          if (isUnhandled(r)) Unhandled
-          else {
-            val nr = canonicalize(r, right)
-            if (isAlive(nr)) Or(left, nr) else left
-          }
-        case nl ⇒
-          val next = canonicalize(nl, left)
-          if (isAlive(next)) Or(next, right) else right
-      }
   }
 
   // TODO
